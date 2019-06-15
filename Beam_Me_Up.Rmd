@@ -1,0 +1,480 @@
+---
+title: "Beam Me Up!"
+output: 
+ prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+# Background
+
+This is my Machine Learning Capstone Project for Algoritma Data Science Academy Batch 4 (Cohort Deragon).
+
+For more information about Algoritma Data Science Academy, please see https://algorit.ma/
+
+This is a project about a ride-sharing business that operating in several big cities in Turkey. The company provide motorcycles ride-sharing service for Turkey’s citizen, and really value the efficiency in traveling through the traffic–the apps even give some reference to Star Trek “beam me up” to their order buttons. In this project, we are going to help them and forecast the driver demand for the next 5 working days.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 9999)
+rm(list=ls())
+```
+
+# Data Preprocessing
+
+We input the Beam_Me dataset into R :
+
+```{r}
+Beam_Me <- read.csv("Beam_Me.csv", stringsAsFactors = FALSE)
+```
+
+These are the library we are going to use :
+
+```{r, echo=TRUE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(forecast)
+library(lubridate)
+library(TTR)
+library(fpp)
+library(fpp2)
+library(xts)
+library(zoo)
+library(ggplot2)
+library(ggthemes)
+library(ggthemr) # devtools::install_github("cttobin/ggthemr")
+library(plotly)
+```
+
+Let's peek into the original Beam_Me dataset :
+
+```{r}
+glimpse(Beam_Me)
+```
+
+As `timeStamp` is the date and hour of order, we change the class into `Date` or `POSIXct` with ymd_hms() funtion from `lubridate` library.
+
+```{r}
+Beam_Me$timeStamp <- ymd_hms(Beam_Me$timeStamp)
+```
+
+```{r}
+class(Beam_Me$timeStamp)
+```
+
+The dataset includes some "cancelled" and duplicated "nodrivers" transactions, which is not representing a real demand, and should not be included in the time series analysis and forecast model. Based on this condition, mfirst we preprocess the data into a proper time series data that represent the true Beam_Me’s demands.
+
+Based on customer behaviour, we can say that there are 3 scenarios of the orderStatus that will be counted as 1 legitimate order :
+1. Costumer ordering and get "confirmed" status.
+2. Customer ordering, get "nodrivers" (and it can be more than 1 time) and keep ordering until he/she get "confirmed" status.
+3. Customer ordering, get "nodrivers" and "cancelled" his/her order.
+
+We'd like to throw the "cancelled" data, as the "cancelled" order is previously presented as "nodrivers". We add Date and Hour columns, as we want to predict the `Hourly Demand` and group our dataset per `riderID`, `Date`, and `Hour`.
+
+```{r}
+Beam_Me_ordered <- Beam_Me %>%
+  filter(orderStatus != "cancelled")
+```
+
+Then we'd like to throw away the "nodrivers" duplicates.
+We add `prevOrder` to change the first "nodrivers" status into "NA" with lag() function, `dupOrder` to see if `prevOrder` is the same as `orderStatus`, and `orderStatus` to see if the `orderStatus` == "nodrivers" and `dupOrder` == "Duplicates" we will change it to "NA", then we can filter our dataset, throwing the all "NA" data from `orderStatus`.
+
+```{r}
+Beam_Me_ordered <- Beam_Me_ordered %>%
+  # prepare date and hour variable
+  mutate(
+    Date = timeStamp %>% format("%Y-%m-%d"),
+    Hour = timeStamp %>% hour()
+  ) %>%
+  # arrange and group by : riders, date, and hour
+  arrange(riderID, Date, Hour) %>%
+  group_by(riderID, Date, Hour) %>%
+  mutate(prevOrder = lag(orderStatus, default = "NA"),
+         dupOrder = ifelse(orderStatus == prevOrder, "Duplicates", "Not Duplicates"),
+         orderStatus = ifelse(orderStatus == "nodrivers" & dupOrder == "Duplicates", NA, orderStatus)) %>%
+  # drop NA in orderStatus
+  filter(!is.na(orderStatus)) %>%
+  # We're left with "nodrivers" and "confirmed", we still have to throw the "nodrivers" to make it 1 legitimate order
+  mutate(nextOrder = lead(orderStatus, default = "NA"),
+         orderStatus = ifelse(orderStatus == "nodrivers" & nextOrder == "confirmed", NA, orderStatus)) %>%
+  filter(!is.na(orderStatus)) %>%
+  # stop the grouping
+  ungroup()
+```
+
+```{r}
+head(Beam_Me_ordered)
+```
+
+We subset the dataset into `Beam_Me_data`.
+
+```{r}
+Beam_Me_data <- Beam_Me_ordered[ , c("timeStamp", "riderID", "orderStatus", "srcGeohash", "Date", "Hour")]
+```
+
+```{r}
+head(Beam_Me_data)
+```
+
+These are the sum of "confirmed" and "nodrivers" orders which represent the real demand from 2017-10-01 to 2017-12-01.
+
+```{r}
+table(Beam_Me_data$orderStatus)
+```
+
+We calculate the demand of Beam_Me drivers, using summarise() and n(), then complete the hour category ( there are some hour that are missing in the data, means there is no order at that Hour, so we change the Demand into 0).
+
+```{r}
+Beam_Me_demand <- Beam_Me_data %>%
+  arrange(Date, Hour) %>%
+  group_by(Date, Hour) %>%
+  # count the number of order by the group
+  summarise(Demand = n()) %>%
+  # stop the grouping
+  ungroup() %>%
+  # complete the Hour category
+  complete(Date, Hour) %>%
+  # replace the NA in Demand with 0, means no order at that hour
+  mutate(Demand = ifelse(is.na(Demand), 0, Demand))
+
+# check
+str(Beam_Me_demand)
+```
+
+```{r}
+Beam_Me_demand <- Beam_Me_demand %>%
+  mutate(timeStamp = paste(Date, Hour) %>% as.POSIXct(format = "%Y-%m-%d %H", tz = "Turkey"))
+```
+
+```{r}
+head(Beam_Me_demand)
+```
+
+```{r}
+tail(Beam_Me_demand)
+```
+
+
+## Cleaned Data Used for Time Series Analysis and Forecasting Future Demands
+
+```{r}
+Beam_Me_demand$Date <- as.Date(Beam_Me_demand$Date)
+glimpse(Beam_Me_demand)
+```
+
+
+```{r}
+range(Beam_Me_demand$timeStamp)
+```
+
+```{r}
+weekdays(min(Beam_Me_demand$timeStamp))
+```
+
+```{r}
+weekdays(max(Beam_Me_demand$timeStamp))
+```
+
+
+```{r}
+# quick check for NA
+Beam_Me_demand %>% is.na() %>% colSums()
+```
+
+
+# Time Series Model of Beam_Me Drivers Demand
+
+Based on the service offered, the Beam_Me’s demands should have a seasonality.
+Let’s try to see the seasonality:
+
+```{r}
+# convert to ts, with 24 hours natural period
+Beam_Me_ts <- ts(Beam_Me_demand$Demand, start = min(Beam_Me_demand$Date), frequency = 24)
+```
+
+```{r}
+# seasonality check
+Beam_Me_ts %>%
+  # sample data for clearer view - 4 week
+  head(24 * 7 * 4) %>%
+  # classical decomposition
+  decompose() %>%
+  autoplot() +
+  theme_calc()
+```
+
+The seasonality is showing a strong additive pattern, but we also have to consider the trend pattern. If you look up closely, you could see that sometimes the trend showing a pattern too. This pattern in trend might be sourced from uncaptured extra seasonality from higher natural period–in this case, weekly or even monthly seasonality. To solve this complex seasonality, we need to convert the data into msts() object which accept multiple frequency setting. Let’s start by trying another higher natural period: a weekly period. Using msts() object, we can use mstl() to decompose multiple seasonalities:
+
+
+```{r fig.height = 4}
+Beam_Me_msts <- msts(Beam_Me_demand$Demand, seasonal.periods = c(24, 24 * 7))
+```
+
+```{r}
+# seasonality check
+Beam_Me_msts %>%
+  # sample data for clearer view - 4 week
+  head(24 * 7 * 4) %>%
+  # classical decomposition
+  mstl() %>%
+  autoplot() +
+  theme_calc()
+```
+
+Now we can see a clearer trend and could confirm the daily and weekly seasonality for the data.
+
+Another way to see this in clear view is to plot the `Demand` distribution between every hours and weekdays:
+
+```{r}
+# number of order distribution between hours and weekdays
+Beam_Me_demand %>% 
+  mutate(
+    Weekdays = timeStamp %>% as.character() %>% as.Date() %>% weekdays()
+  ) %>% 
+  ggplot(aes(x = Hour, y = Demand, fill = factor(Weekdays))) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(
+    title = "Beam_Me's Order by Hours and Weekdays",
+    y = "Number of Demand",
+    x = "Hour of the Day",
+    fill = ""
+  ) +
+  theme(legend.position = "bottom") +
+  theme_calc() +
+  scale_colour_calc()
+```
+
+From the distribution, we can confirm that not every weekdays have the same hour seasonality pattern.
+
+# Forecasting Beam_Me’s Demands per Hour
+
+Based on previous trend and seasonality analysis, we must consider forecast model that could accept multiple seasonality. There are some options for this kind of model:
+1. Use `mstl()` for seasonality adjustment, then use `ets()` to forecast the trend–this can be done simultaneously using `stlm()`
+2. Use `tbats()` for complex combination of `ets()` and modelling the error with `auto.arima()` with complex seasonality setting
+
+Another thing that need to be considered is the `zero values`. With so many zero value, we can not do log transformation for the data. One technique to solve this problem is adding a constant value to our data, and readjust the following forecast by substracting the same value of constant.
+
+I will use a function to do the substraction for a forecast class objects:
+
+```{r}
+# adding a constant to our data
+Beam_Me_ts <- Beam_Me_ts + 1
+Beam_Me_msts <- Beam_Me_msts + 1
+
+# forecast value constant readjustment
+forecastConsReadj <- function(forecastObj, constant) {
+
+  forecastObj[["mean"]] <- forecastObj[["mean"]] - constant
+  forecastObj[["upper"]] <- forecastObj[["upper"]] - constant
+  forecastObj[["lower"]] <- forecastObj[["lower"]] - constant
+  
+  return(forecastObj)
+  
+}
+```
+
+Let's split the dataset into train and test set. As one of the seasonal periods is 7 days and started at Sunday, we want to end the train set in a full loop and cut it to the last Saturday, which we have the last 6 days in the test set.
+
+```{r}
+# keep the original ts & msts dataset
+tsOri <- Beam_Me_ts
+mstsOri <- Beam_Me_msts
+
+# test dataset
+tsTest <- Beam_Me_ts %>% tail(24 * 6)
+
+# don't forget to readjust
+tsTest <- tsTest - 1
+
+# train dataset
+Beam_Me_ts %>% head(length(.) - 24 * 6)
+```
+
+```{r}
+Beam_Me_msts %>% head(length(.) - 24 * 6)
+```
+
+
+We will also include a basic `ets()` with `log transformation` as a benchmark model. In modelling the log transformation, we can use `lambda = 0` in `stlm()` setting. But `tbats()` function can not accept initial `lambda = 0` value, so we need to convert to log `before` passing into `tbats()`, and reset the lambda value manually:
+
+```{r}
+# basic ets
+etsMod <- Beam_Me_ts %>%
+  ets(lambda = 0) %>%
+  forecast(h = 24 * 6) %>%
+  forecastConsReadj(constant = 1)
+
+# stlm
+stlmMod <- Beam_Me_msts %>%
+  stlm(lambda = 0) %>% 
+  forecast(h = 24 * 6) %>%
+  forecastConsReadj(constant = 1)
+
+# tbats
+tbatsMod <- Beam_Me_msts %>%
+  log() %>% # log transformation
+  tbats(use.box.cox = FALSE)
+
+tbatsMod$lambda <- 0
+
+tbatsMod %<>%
+  forecast(h = 24 * 6) %>% # forecast
+  forecastConsReadj(constant = 1)
+```
+ 
+Let's check the accuracy for each forecast models on our test dataset :
+
+```{r}
+# some forecast accuracy metrics
+rbind(
+  # ets' accuracy
+  accuracy(etsMod$mean %>% as.vector() %>% round(), tsTest),
+  # stlm's accuracy
+  accuracy(stlmMod$mean %>% as.vector() %>% round(), tsTest),
+  # tbats' accuracy
+  accuracy(tbatsMod$mean %>% as.vector() %>% round(), tsTest)
+  ) %>%
+  # tidy-up to a dataframe
+  broom::tidy() %>% 
+  mutate(.rownames = c("ets", "stlm", "tbats")) %>% 
+  rename(models = .rownames)
+```
+
+It seems the accuracy of stlm() is showing the best MAE results, and tbats() being the second. But if we analyze the forecast using graph:
+
+```{r}
+# create a data frame of test data and all forecast data
+accuracyData <- data.frame(
+  timeStamp = Beam_Me_demand$timeStamp %>% tail(24 * 6),
+  actual = tsTest %>% as.vector(),
+  etsForecast = etsMod$mean %>% as.vector(),
+  stlmForecast = stlmMod$mean %>% as.vector(),
+  tbatsForecast = tbatsMod$mean %>% as.vector()
+)
+
+# plot the data
+accuracyData %>%
+  gather(key, value, actual, matches("Forecast")) %>% 
+  mutate(key = key %>% str_replace_all("Forecast", "")) %>% 
+  ggplot(aes(x = timeStamp, y = value, colour = factor(key))) +
+  geom_line() +
+  labs(
+    title = "Beam_Me's Order by Hours on Simulated Test Dataset",
+    y = "Number of Order",
+    x = "Date",
+    colour = ""
+  ) +
+  theme_calc() +
+  scale_color_calc()
+```
+
+The forecast from tbats() is good because it follow the two seasonality very well. Meanwhile, the forecast from ets() is giving the highest error, too overfitting compared to the actual data. The last but not least, stlm(), showing a better seasonality modelling, eventhough the stlm() function following the same notion of ets(), the model choose to take a constant mean, but instead of one, the model give a constant mean for two seasonality–daily and weekly seasonality:
+
+```{r}
+# the form of stlm forecast
+Beam_Me_msts %>%
+  stlm(lambda = 0) %>% 
+  forecast(h = 24 * 6) %>%
+  forecastConsReadj(constant = 1) %$%
+  mean %>% 
+  plot()
+```
+
+`Notes from our teaching assistant :`
+This is why stlm() results is slightly differ from tbats(), which modelling multiple seasonality using arima with fourier terms–we could say it like smoothing the seasonalities pattern. In other words, a tbats() model would trying to fit multiple seasonality by trying the best value to replicating the patterns, instead of using mean value produced from seasonality decomposition:
+
+```{r}
+# tbats
+tbatsMod <- Beam_Me_msts %>%
+  log() %>%
+  tbats(use.box.cox = FALSE)
+
+tbatsMod$lambda <- 0
+
+tbatsMod %>%
+  forecast(h = 24 * 6) %>%
+  forecastConsReadj(constant = 1) %$%
+  mean %>% 
+  plot()
+```
+
+`Notes from our teaching assistant :`
+You can notice that the seasonalities are smoother than the forecast from stlm(). But don’t be deceived by the smoothing property of tbats(), because if look back at the principle of “believing the mean”, then tbats() forecast would be more fluctuative in term of seasonalities mean; recall that it does the smoothing process using arima, which is by nature seek a better fit to the fluctuation, instead of a better fit to the mean.
+
+So we are faced with a common trade-off in forecast problems: trusting a “safe” constant mean model, the ets(), or take a “risk” on a more fluctuative model, tbats(). Turns out, the answer is “in between” of the two: stlm().
+
+`Key-advice from our teaching assistant :`
+First, refit the models on full train dataset. Recall that the actual evaluation dataset is on the next 5 business days, so we need to forecast to 7 days ahead, then subset to only the last 5 days:
+
+```{r}
+# basic ets
+etsMod <- tsOri %>%
+  ets(lambda = 0) %>%
+  forecast(h = 24 * 7) %>%
+  forecastConsReadj(constant = 1)
+
+# stlm
+stlmMod <- mstsOri %>%
+  stlm(lambda = 0) %>% 
+  forecast(h = 24 * 7) %>%
+  forecastConsReadj(constant = 1)
+
+# tbats
+tbatsMod <- mstsOri %>%
+  log() %>%
+  tbats(use.box.cox = FALSE)
+
+tbatsMod$lambda <- 0
+
+tbatsMod %<>%
+  forecast(h = 24 * 7) %>%
+  forecastConsReadj(constant = 1)
+```
+
+```{r}
+# gather all forecast data
+Beam_Me_pred <- read.csv("submissionForecast.csv")
+
+Beam_Me_pred <- cbind.data.frame(Beam_Me_pred,
+    etsForecast = etsMod$mean %>% as.vector() %>% tail(24 * 5) %>% round(),
+    stlmForecast = stlmMod$mean %>% as.vector() %>% head(24 * 7) %>% tail(24 * 5) %>% round(),
+    tbatsForecast = tbatsMod$mean %>% as.vector() %>% tail(24 * 5) %>% round()
+  )
+
+Beam_Me_pred$nOrder <- NULL
+```
+
+```{r}
+head(Beam_Me_pred)
+```
+
+Based on previous modelings, we will choose the model with the lowest MAE, the stlmForecast, as the result of the demand forecasting for the next 5 business days (Monday, 2017/12/04 to Friday Friday, 2017/12/08).
+
+```{r}
+Beam_Me_submit <- Beam_Me_pred[ , c("timeStamp", "stlmForecast")]
+names(Beam_Me_submit) <- c("timeStamp", "nOrder")
+Beam_Me_submit$timeStamp <- ymd_hms(Beam_Me_submit$timeStamp)
+```
+
+```{r}
+head(Beam_Me_submit)
+tail(Beam_Me_submit)
+```
+
+```{r}
+ggplot(data = Beam_Me_demand, aes(x = timeStamp, y = Demand, color)) +
+  geom_line(aes(color = "First line")) +
+  geom_line(data = Beam_Me_submit, aes(x = timeStamp, y = nOrder, color = "Second line")) +
+  xlab("Time") +
+  ylab("Demand") +
+  ggtitle("Actual and Forecast Beam_Me Drivers Demand") +
+  theme_calc() +
+  scale_color_manual(values = c("blue", "red"),
+                     labels = c("Actual", "Forecast"))
+```
+
+The blue line : the actual data of Beam_Me driver demand from Oct 1, 2017 to Dec 1, 2017.
+The red line : the forecast for the next 5 working days, from Dec 4, 2017 to Dec 8, 2017.
+There's a gap in the data, it means the weekends after Dec 1, 2017 so they don't show in the data visualization.
+
