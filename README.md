@@ -1,0 +1,2 @@
+# beam-me-up
+This is a project about a ride-sharing business that operating in several big cities in Turkey. The company provide motorcycles ride-sharing service for Turkey’s citizen, and really value the efficiency in traveling through the traffic–the apps even give some reference to Star Trek “beam me up” to their order buttons. In this project, we are going to help them and forecast the driver demand for the next 5 working days.
